@@ -40,13 +40,17 @@
 
 namespace android {
 
+namespace {
+constexpr auto PERMISSION_GRANTED = permission::PermissionChecker::PERMISSION_GRANTED;
+constexpr auto PERMISSION_HARD_DENIED = permission::PermissionChecker::PERMISSION_HARD_DENIED;
+}
+
 using content::AttributionSourceState;
 
 static const String16 sAndroidPermissionRecordAudio("android.permission.RECORD_AUDIO");
 static const String16 sModifyPhoneState("android.permission.MODIFY_PHONE_STATE");
 static const String16 sModifyAudioRouting("android.permission.MODIFY_AUDIO_ROUTING");
 static const String16 sCallAudioInterception("android.permission.CALL_AUDIO_INTERCEPTION");
-static const String16 sAndroidPermissionBluetoothConnect("android.permission.BLUETOOTH_CONNECT");
 
 static String16 resolveCallingPackage(PermissionController& permissionController,
         const std::optional<String16> opPackageName, uid_t uid) {
@@ -71,16 +75,30 @@ static String16 resolveCallingPackage(PermissionController& permissionController
 
 int32_t getOpForSource(audio_source_t source) {
   switch (source) {
-    case AUDIO_SOURCE_HOTWORD:
-      return AppOpsManager::OP_RECORD_AUDIO_HOTWORD;
+    case AUDIO_SOURCE_FM_TUNER:
+        return AppOpsManager::OP_NONE;
     case AUDIO_SOURCE_ECHO_REFERENCE: // fallthrough
     case AUDIO_SOURCE_REMOTE_SUBMIX:
       return AppOpsManager::OP_RECORD_AUDIO_OUTPUT;
     case AUDIO_SOURCE_VOICE_DOWNLINK:
       return AppOpsManager::OP_RECORD_INCOMING_PHONE_AUDIO;
+    case AUDIO_SOURCE_HOTWORD:
+      return AppOpsManager::OP_RECORD_AUDIO_HOTWORD;
     case AUDIO_SOURCE_DEFAULT:
     default:
       return AppOpsManager::OP_RECORD_AUDIO;
+  }
+}
+
+bool isRecordOpRequired(audio_source_t source) {
+  switch (source) {
+    case AUDIO_SOURCE_FM_TUNER:
+    case AUDIO_SOURCE_ECHO_REFERENCE: // fallthrough
+    case AUDIO_SOURCE_REMOTE_SUBMIX:
+    case AUDIO_SOURCE_VOICE_DOWNLINK:
+        return false;
+    default:
+      return true;
   }
 }
 
@@ -113,7 +131,7 @@ std::optional<AttributionSourceState> resolveAttributionSource(
     return std::optional<AttributionSourceState>{myAttributionSource};
 }
 
-static bool checkRecordingInternal(const AttributionSourceState& attributionSource,
+static int checkRecordingInternal(const AttributionSourceState& attributionSource,
         const String16& msg, bool start, audio_source_t source) {
     // Okay to not track in app ops as audio server or media server is us and if
     // device is rooted security model is considered compromised.
@@ -121,39 +139,74 @@ static bool checkRecordingInternal(const AttributionSourceState& attributionSour
     // user is active, but it is a core system service so let it through.
     // TODO(b/141210120): UserManager.DISALLOW_RECORD_AUDIO should not affect system user 0
     uid_t uid = VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(attributionSource.uid));
-    if (isAudioServerOrMediaServerOrSystemServerOrRootUid(uid)) return true;
-
-    // We specify a pid and uid here as mediaserver (aka MediaRecorder or StageFrightRecorder)
-    // may open a record track on behalf of a client. Note that pid may be a tid.
-    // IMPORTANT: DON'T USE PermissionCache - RUNTIME PERMISSIONS CHANGE.
-    const std::optional<AttributionSourceState> resolvedAttributionSource =
-            resolveAttributionSource(attributionSource);
-    if (!resolvedAttributionSource.has_value()) {
-        return false;
-    }
+    if (isAudioServerOrMediaServerOrSystemServerOrRootUid(uid)) return PERMISSION_GRANTED;
 
     const int32_t attributedOpCode = getOpForSource(source);
+    if (isRecordOpRequired(source)) {
+        // We specify a pid and uid here as mediaserver (aka MediaRecorder or StageFrightRecorder)
+        // may open a record track on behalf of a client. Note that pid may be a tid.
+        // IMPORTANT: DON'T USE PermissionCache - RUNTIME PERMISSIONS CHANGE.
+        std::optional<AttributionSourceState> resolvedAttributionSource =
+                resolveAttributionSource(attributionSource);
+        if (!resolvedAttributionSource.has_value()) {
+            return PERMISSION_HARD_DENIED;
+        }
 
-    permission::PermissionChecker permissionChecker;
-    bool permitted = false;
-    if (start) {
-        permitted = (permissionChecker.checkPermissionForStartDataDeliveryFromDatasource(
-                sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
-                attributedOpCode) != permission::PermissionChecker::PERMISSION_HARD_DENIED);
+        permission::PermissionChecker permissionChecker;
+        int permitted;
+        if (start) {
+            // Do a double-check, where we first check without actually starting in order to handle
+            // the behavior of AppOps where ops are sometimes started but paused for SOFT_DENIED.
+            // Since there is no way to maintain reference consensus due to this behavior, avoid
+            // starting an op when a restriction is in place by first checking. In the case where we
+            // startOp would fail, call a noteOp (which will also fail) instead. This preserves
+            // behavior that is reliant on listening to op rejected events (such as the hint
+            // dialogue to unmute the microphone). Technically racy, but very unlikely.
+            //
+            // TODO(b/294609684) To be removed when the pause state for an OP is removed.
+            permitted = permissionChecker.checkPermissionForPreflightFromDatasource(
+                    sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                    attributedOpCode);
+            if (permitted == PERMISSION_GRANTED) {
+                permitted = permissionChecker.checkPermissionForStartDataDeliveryFromDatasource(
+                        sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                        attributedOpCode);
+            } else {
+                // intentionally don't set permitted
+                permissionChecker.checkPermissionForDataDeliveryFromDatasource(
+                            sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                            attributedOpCode);
+            }
+        } else {
+            permitted = permissionChecker.checkPermissionForPreflightFromDatasource(
+                    sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
+                    attributedOpCode);
+        }
+
+        return permitted;
     } else {
-        permitted = (permissionChecker.checkPermissionForPreflightFromDatasource(
-                sAndroidPermissionRecordAudio, resolvedAttributionSource.value(), msg,
-                attributedOpCode) != permission::PermissionChecker::PERMISSION_HARD_DENIED);
+        if (attributedOpCode == AppOpsManager::OP_NONE) return PERMISSION_GRANTED;  // nothing to do
+        AppOpsManager ap{};
+        PermissionController pc{};
+        return ap.startOpNoThrow(
+                attributedOpCode, attributionSource.uid,
+                resolveCallingPackage(pc,
+                                      String16{attributionSource.packageName.value_or("").c_str()},
+                                      attributionSource.uid),
+                false,
+                attributionSource.attributionTag.has_value()
+                        ? String16{attributionSource.attributionTag.value().c_str()}
+                        : String16{},
+                msg);
     }
-
-    return permitted;
 }
 
 bool recordingAllowed(const AttributionSourceState& attributionSource, audio_source_t source) {
-    return checkRecordingInternal(attributionSource, String16(), /*start*/ false, source);
+    return checkRecordingInternal(attributionSource, String16(), /*start*/ false, source) !=
+            PERMISSION_HARD_DENIED;
 }
 
-bool startRecording(const AttributionSourceState& attributionSource, const String16& msg,
+int startRecording(const AttributionSourceState& attributionSource, const String16& msg,
         audio_source_t source) {
     return checkRecordingInternal(attributionSource, msg, /*start*/ true, source);
 }
@@ -164,19 +217,32 @@ void finishRecording(const AttributionSourceState& attributionSource, audio_sour
     uid_t uid = VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(attributionSource.uid));
     if (isAudioServerOrMediaServerOrSystemServerOrRootUid(uid)) return;
 
-    // We specify a pid and uid here as mediaserver (aka MediaRecorder or StageFrightRecorder)
-    // may open a record track on behalf of a client. Note that pid may be a tid.
-    // IMPORTANT: DON'T USE PermissionCache - RUNTIME PERMISSIONS CHANGE.
-    const std::optional<AttributionSourceState> resolvedAttributionSource =
-            resolveAttributionSource(attributionSource);
-    if (!resolvedAttributionSource.has_value()) {
-        return;
-    }
-
     const int32_t attributedOpCode = getOpForSource(source);
-    permission::PermissionChecker permissionChecker;
-    permissionChecker.finishDataDeliveryFromDatasource(attributedOpCode,
-            resolvedAttributionSource.value());
+    if (isRecordOpRequired(source)) {
+        // We specify a pid and uid here as mediaserver (aka MediaRecorder or StageFrightRecorder)
+        // may open a record track on behalf of a client. Note that pid may be a tid.
+        // IMPORTANT: DON'T USE PermissionCache - RUNTIME PERMISSIONS CHANGE.
+        const std::optional<AttributionSourceState> resolvedAttributionSource =
+                resolveAttributionSource(attributionSource);
+        if (!resolvedAttributionSource.has_value()) {
+            return;
+        }
+
+        permission::PermissionChecker permissionChecker;
+        permissionChecker.finishDataDeliveryFromDatasource(attributedOpCode,
+                resolvedAttributionSource.value());
+    } else {
+        if (attributedOpCode == AppOpsManager::OP_NONE) return;  // nothing to do
+        AppOpsManager ap{};
+        PermissionController pc{};
+        ap.finishOp(attributedOpCode, attributionSource.uid,
+                    resolveCallingPackage(
+                            pc, String16{attributionSource.packageName.value_or("").c_str()},
+                            attributionSource.uid),
+                    attributionSource.attributionTag.has_value()
+                            ? String16{attributionSource.attributionTag.value().c_str()}
+                            : String16{});
+    }
 }
 
 bool captureAudioOutputAllowed(const AttributionSourceState& attributionSource) {
@@ -373,48 +439,6 @@ status_t checkIMemory(const sp<IMemory>& iMemory)
     }
 
     return NO_ERROR;
-}
-
-/**
- * Determines if the MAC address in Bluetooth device descriptors returned by APIs of
- * a native audio service (audio flinger, audio policy) must be anonymized.
- * MAC addresses returned to system server or apps with BLUETOOTH_CONNECT permission
- * are not anonymized.
- *
- * @param attributionSource The attribution source of the calling app.
- * @param caller string identifying the caller for logging.
- * @return true if the MAC addresses must be anonymized, false otherwise.
- */
-bool mustAnonymizeBluetoothAddress(
-        const AttributionSourceState& attributionSource, const String16& caller) {
-    uid_t uid = VALUE_OR_FATAL(aidl2legacy_int32_t_uid_t(attributionSource.uid));
-    if (isAudioServerOrSystemServerUid(uid)) {
-        return false;
-    }
-    const std::optional<AttributionSourceState> resolvedAttributionSource =
-            resolveAttributionSource(attributionSource);
-    if (!resolvedAttributionSource.has_value()) {
-        return true;
-    }
-    permission::PermissionChecker permissionChecker;
-    return permissionChecker.checkPermissionForPreflightFromDatasource(
-            sAndroidPermissionBluetoothConnect, resolvedAttributionSource.value(), caller,
-            AppOpsManager::OP_BLUETOOTH_CONNECT)
-                != permission::PermissionChecker::PERMISSION_GRANTED;
-}
-
-/**
- * Modifies the passed MAC address string in place for consumption by unprivileged clients.
- * the string is assumed to have a valid MAC address format.
- * the anonymzation must be kept in sync with toAnonymizedAddress() in BluetoothUtils.java
- *
- * @param address input/output the char string contining the MAC address to anonymize.
- */
-void anonymizeBluetoothAddress(char *address) {
-    if (address == nullptr || strlen(address) != strlen("AA:BB:CC:DD:EE:FF")) {
-        return;
-    }
-    memcpy(address, "XX:XX:XX:XX", strlen("XX:XX:XX:XX"));
 }
 
 sp<content::pm::IPackageManagerNative> MediaPackageManager::retrievePackageManager() {
